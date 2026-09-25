@@ -130,6 +130,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun applyFeedMode() {
         if (::swipeRefresh.isInitialized) swipeRefresh.isEnabled = true
+        if (::statsBadge.isInitialized) statsBadge.visibility = View.VISIBLE
         if (::webView.isInitialized) {
             webView.settings.useWideViewPort = false
             webView.settings.loadWithOverviewMode = false
@@ -140,9 +141,11 @@ class MainActivity : AppCompatActivity() {
      * Messenger.com serves a desktop layout: disable pull-to-refresh (it steals
      * vertical scroll and clips the fixed header) and enable the overview
      * viewport so the page scales to the phone width instead of cutting off.
+     * Also hides the stats badge so it never covers the chat composer.
      */
     private fun applyMessengerMode() {
         if (::swipeRefresh.isInitialized) swipeRefresh.isEnabled = false
+        if (::statsBadge.isInitialized) statsBadge.visibility = View.GONE
         if (::webView.isInitialized) {
             webView.settings.useWideViewPort = true
             webView.settings.loadWithOverviewMode = true
