@@ -24,11 +24,22 @@ class MainActivity : AppCompatActivity() {
 
     companion object {
         private const val FB_URL = "https://web.facebook.com/"
+        // Desktop UA is the long-standing bypass for Meta's "Get Messenger"
+        // install wall (mobile UAs are walled on every messages host);
+        // the feed stays on the lightweight WebLite mobile UA.
         private const val MESSENGER_URL = "https://www.messenger.com/"
         private const val MOBILE_UA =
             "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
         private const val DESKTOP_UA =
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        // Single source of truth for "Get Messenger" install-wall signals,
+        // shared by the JS detector and the Kotlin re-probe below. NOTE:
+        // English-only; non-English sessions will log OK instead of WALL.
+        private val CHAT_WALL_MARKERS = listOf(
+            "get messenger", "conversations are moving", "install the app",
+            "download messenger", "mobile browsers", "use the messenger app",
+            "open in the messenger", "blocked", "unavailable",
+        )
     }
 
     private lateinit var webView: WebView
@@ -104,16 +115,19 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun isMessagesUrl(url: String): Boolean {
-        return url.contains("facebook.com/messages")
+        return url.contains("/messages")
+    }
+
+    private fun isChatUrl(url: String?): Boolean {
+        return url != null && (url.contains("/messages") || url.contains("messenger.com"))
     }
 
     /**
-     * Centralized redirect to messenger.com with the desktop UA.
-     * Issue #2: the Message tab fires an SPA navigation that never hits
-     * onPageFinished on first click, so every navigation callback routes here.
-     * The navigation must start synchronously: settings.userAgentString applies
-     * to the next loadUrl, and deferring it (view.post) leaves a window where
-     * onPageFinished of the settling feed resets the UA back to mobile.
+     * Centralized redirect to the desktop chat stack. The desktop UA must be
+     * set synchronously before loadUrl: the Message tab fires an SPA
+     * navigation that never hits onPageFinished on first click (issue #2),
+     * and the UA has to be desktop before FB's chat bootstrap runs, otherwise
+     * it serves the "Get Messenger" install wall.
      */
     private fun redirectToMessenger(view: WebView, target: String = MESSENGER_URL) {
         // Avoid redirect loops when already on the target page
@@ -138,10 +152,10 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * Messenger.com serves a desktop layout: disable pull-to-refresh (it steals
-     * vertical scroll and clips the fixed header) and enable the overview
-     * viewport so the page scales to the phone width instead of cutting off.
-     * Also hides the stats badge so it never covers the chat composer.
+     * Desktop chat layout: disable pull-to-refresh (it steals vertical
+     * scroll and clips the fixed header), enable the overview viewport so
+     * the page scales to phone width, and hide the stats badge so it never
+     * covers the chat composer.
      */
     private fun applyMessengerMode() {
         if (::swipeRefresh.isInitialized) swipeRefresh.isEnabled = false
@@ -234,9 +248,9 @@ class MainActivity : AppCompatActivity() {
         webView.webViewClient = object : WebViewClient() {
             override fun onPageStarted(view: WebView, url: String?, favicon: android.graphics.Bitmap?) {
                 super.onPageStarted(view, url, favicon)
-                // Don't touch messenger.com: it is WebSocket-heavy and replacing
-                // WebSocket.prototype breaks its transport (issue #2 cut-off).
-                if (url?.contains("messenger.com") == true) return
+                // Don't touch chat pages: they are WebSocket-heavy and replacing
+                // WebSocket.prototype breaks their transport (issue #2 cut-off).
+                if (isChatUrl(url)) return
                 view.evaluateJavascript("""(function(){
                     if(window.__sb_ws_hooked)return;window.__sb_ws_hooked=true;
                     var orig=WebSocket.prototype.send;
@@ -282,24 +296,38 @@ class MainActivity : AppCompatActivity() {
                 val url = request.url.toString()
                 val scheme = request.url.scheme ?: ""
                 Log.d("SlimBook", "NAV: $url")
+                // Swallow app-store pushes: FB bounces mobile chat users to the
+                // Play Store ("Get Messenger"). Stay in the WebView instead —
+                // going back usually lands on the working chat (FaceSlim trick).
+                if (scheme == "market" || url.contains("play.google.com/store")) {
+                    Log.d("SlimBook", "CHAT_STORE_BLOCK:$url")
+                    if (view.canGoBack()) view.goBack()
+                    return true
+                }
                 // Handle intent:// URLs for messenger share
                 if (scheme == "intent" && url.contains("fb-messenger")) {
                     val linkMatch = Regex("link=([^&]+)").find(url)
                     val link = linkMatch?.groupValues?.get(1)?.let { java.net.URLDecoder.decode(it, "UTF-8") } ?: ""
                     if (link.isNotEmpty()) {
-                        redirectToMessenger(view, "https://www.messenger.com/new?link=${java.net.URLEncoder.encode(link, "UTF-8")}")
+                        redirectToMessenger(view, "$MESSENGER_URL/new?link=${java.net.URLEncoder.encode(link, "UTF-8")}")
                     } else {
                         redirectToMessenger(view)
                     }
                     return true
                 }
-                // Redirect fb-messenger:// and messages URLs to messenger.com (like SlimSocial)
+                // Other intent:// URLs (e.g. Play Store intents): stay in app.
+                if (scheme == "intent") {
+                    Log.d("SlimBook", "CHAT_STORE_BLOCK:$url")
+                    return true
+                }
+                // Redirect fb-messenger:// and messages URLs to the desktop
+                // chat stack (like SlimSocial).
                 if (scheme == "fb-messenger" || scheme == "fb" || isMessagesUrl(url)) {
                     redirectToMessenger(view)
                     return true
                 }
-                // Coming back from messenger to facebook - restore mobile UA
-                if (url.contains("www.facebook.com") && !url.contains("/messages") && view.url?.contains("messenger.com") == true) {
+                // Coming back from chat to facebook - restore mobile UA
+                if (url.contains("facebook.com") && !url.contains("/messages") && isChatUrl(view.url)) {
                     isMessengerMode = false
                     messengerRedirectPending = false
                     view.settings.userAgentString = MOBILE_UA
@@ -332,18 +360,16 @@ class MainActivity : AppCompatActivity() {
 
             override fun onPageFinished(view: WebView, url: String) {
                 Log.d("SlimBook", "PAGE: $url")
-                // If we ended up on a messages page, redirect to messenger.com
-                if (isMessagesUrl(url)) {
-                    redirectToMessenger(view)
-                    return
-                }
-                // Stay in messenger mode: keep desktop UA + messenger layout
-                if (url.contains("messenger.com")) {
+                // Stay in messenger mode: keep desktop UA + chat layout
+                if (isChatUrl(url)) {
                     isMessengerMode = true
                     messengerRedirectPending = false
+                    if (view.settings.userAgentString != DESKTOP_UA) {
+                        view.settings.userAgentString = DESKTOP_UA
+                    }
                     applyMessengerMode()
                     swipeRefresh.isRefreshing = false
-                    repairMessengerLayout(view)
+                    applyMessengerTweaks(view, url)
                     return
                 }
                 // A settling Facebook page finishing after a messenger redirect
@@ -420,13 +446,91 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * Issue #2 cut-off: messenger.com's virtualized chat grid sometimes mounts
-     * ~100px tall (overflow hidden) while its navigation pane is full-height —
-     * likely measured mid-transition during messenger's auto-nav to the last
-     * thread — so only ~1.5 rows paint and the column can't scroll. Repair:
-     * size the collapsed wrappers to fill the pane, make the grid scrollable,
-     * then kick it with scroll/resize events so it renders rows.
-     * Messenger-only, session-local; reverts itself if geometry looks insane.
+     * Chat entry point: light chrome-hiding CSS, "Get Messenger" install-wall
+     * detection with an on-page bypass attempt ("continue on web"-style
+     * dismissal), plus the virtualized-grid repair (the grid sometimes mounts
+     * ~100px tall while its navigation pane is full-height, painting ~1.5
+     * rows with no scroll). Detect-and-log only: no cross-host fallback —
+     * the wall markers + probe exist so a future Meta change is diagnosable
+     * from logcat. Everything is session-local and reverts itself if
+     * geometry looks insane.
+     */
+    private fun applyMessengerTweaks(view: WebView, url: String) {
+        val markersJs = CHAT_WALL_MARKERS.joinToString(",") { "'$it'" }
+        view.evaluateJavascript("""
+            (function() {
+                if (window.__sb_chat_tweaked) return;
+                window.__sb_chat_tweaked = true;
+                // NOTE: never hide a[href="/"] or [aria-label="Facebook"] —
+                // that is the header logo linking back to the feed, the only
+                // on-screen path out of chat.
+                var css = 'a[href="/watch"],a[href="/marketplace"],'
+                    + '[aria-label="Search Facebook"]{display:none!important;}'
+                    + 'form[role="search"]{display:none!important;}';
+                var st = document.createElement('style');
+                st.id = 'slimbook-chat';
+                st.textContent = css;
+                document.documentElement.appendChild(st);
+                function low(s, n) { return ((s || '').slice(0, n || 600)).toLowerCase(); }
+                var markers = [$markersJs];
+                function wallPresent() {
+                    var body = low(document.body && document.body.innerText, 600);
+                    var title = low(document.title, 120);
+                    for (var i = 0; i < markers.length; i++) {
+                        if (body.indexOf(markers[i]) !== -1 || title.indexOf(markers[i]) !== -1) return markers[i];
+                    }
+                    return null;
+                }
+                function chatPresent() {
+                    return !!document.querySelector('[role="grid"],[role="main"] input,'
+                        + '[aria-label*="essage"] input,[placeholder*="essage"]');
+                }
+                var hit = wallPresent();
+                if (hit && !chatPresent()) {
+                    // Try the on-page bypass: many FB interstitials hide a
+                    // web-continue path behind the CTA. English-only, like the
+                    // markers above.
+                    var clicked = null;
+                    var els = document.querySelectorAll('a,button,[role="button"]');
+                    for (var k = 0; k < els.length; k++) {
+                        var t = low(els[k].innerText || els[k].getAttribute('aria-label') || '', 80);
+                        if (/continue on web|not now|use facebook|dismiss|^close$|no thanks/.test(t)) {
+                            try { els[k].click(); clicked = t; } catch (e) {}
+                            break;
+                        }
+                    }
+                    console.log('SLIMBOOK_CHAT:WALL:' + hit + ':bypass=' + (clicked || 'none')
+                        + ':' + document.title.slice(0, 80));
+                } else {
+                    console.log('SLIMBOOK_CHAT:OK:' + document.title.slice(0, 80));
+                }
+            })();
+        """.trimIndent(), null)
+        // Re-probe after async render (wall text often arrives after
+        // onPageFinished). Log-only: no navigation, just a signal for logs.
+        view.postDelayed({
+            if (!isChatUrl(view.url)) return@postDelayed
+            view.evaluateJavascript(
+                "JSON.stringify({t: document.title, b: (document.body && document.body.innerText || '').slice(0, 500), chat: !!document.querySelector('[role=\"grid\"],[placeholder*=\"essage\"]')})",
+            ) { json ->
+                if (json == null) return@evaluateJavascript
+                val lower = json.lowercase()
+                val wall = CHAT_WALL_MARKERS.any { lower.contains(it) } &&
+                    !lower.contains("\"chat\":true")
+                Log.d("SlimBook", "CHAT_PROBE:$url wall=$wall -> $json".take(300))
+            }
+        }, 2500)
+        repairMessengerLayout(view)
+    }
+
+    /**
+     * The desktop chat grid sometimes mounts collapsed (~100px tall, overflow
+     * hidden) while its navigation pane is full-height — likely measured
+     * mid-transition during auto-nav to the last thread — so only ~1.5 rows
+     * paint and the column can't scroll. Size the collapsed wrappers to fill
+     * the pane, make the grid scrollable, then kick it with scroll/resize
+     * events so it renders rows. Chat-only, session-local; reverts itself if
+     * geometry looks insane.
      */
     private fun repairMessengerLayout(view: WebView) {
         view.evaluateJavascript("""
@@ -512,9 +616,9 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun injectFilter() {
-        // Never inject feed filtering/tracking hooks into messenger.com
-        // (breaks its messaging transport and layout).
-        if (webView.url?.contains("messenger.com") == true) return
+        // Never inject feed filtering/tracking hooks into chat pages
+        // (breaks their messaging transport and layout).
+        if (isChatUrl(webView.url)) return
         if (filterJs.isNotEmpty()) {
             webView.evaluateJavascript(filterJs, null)
         }
@@ -815,8 +919,8 @@ class MainActivity : AppCompatActivity() {
     @Deprecated("Use OnBackPressedCallback")
     override fun onBackPressed() {
         val url = webView.url ?: ""
-        if (url.contains("messenger.com")) {
-            // Leave messenger - go back to feed with mobile UA
+        if (isChatUrl(url)) {
+            // Leave chat - go back to feed with mobile UA
             isMessengerMode = false
             messengerRedirectPending = false
             webView.settings.userAgentString = MOBILE_UA
